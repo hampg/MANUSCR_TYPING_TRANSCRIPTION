@@ -1,4 +1,4 @@
-# ÁGNENTÍV KÉZ- ÉS GÉPÍRÁS ÁTÍRÓ PIPELINE ÷ RUNBOOK
+# ÁGNENTÍV KÉZ- ÉS GÉPÍRÁS ÁTÍRÓ PIPELINE – RUNBOOK
 Agentív kézírás–gépelés transzkripciós pipeline – RUNBOOK
 
 Ez a RUNBOOK lépésről lépésre bemutatja, hogyan lehet egy agentív OCR + transzkripciós munkafolyamatot felállítani, futtatni, újraindítani és auditálható módon dokumentálni. A cél kifejezetten akadémiai kutatásra alkalmas, reprodukálható feldolgozás.
@@ -269,4 +269,61 @@ Ezért alkalmas:
 
 ⸻
 
-Ez a RUNBOOK élő dokumentum. Javasolt minden módszertani változtatást commitként rögzíteni.
+11. Known states & recovery
+
+Normalization (v2) – ismert állapot és korlátozás
+
+
+A jelenlegi agent-verzióban a normalizált (v2) szöveg egyetlen, összefüggő modellhívással készül a teljes, összefűzött diplomatic v1 alapján.
+
+Ez azt jelenti, hogy:
+	•	a diplomatic v1 oldalanként készül, majd összefűzésre kerül
+	•	a corrected v2 nem oldalanként, hanem egyben készül
+
+Fontos következmény
+
+Ha bármely oldal transzkripciója sikertelen (status: failed), akkor:
+	•	a v1 hiányos vagy csonka lehet,
+	•	a v2 csak részleges szöveget fog tartalmazni (pl. egyetlen oldalnyi kimenetet),
+	•	a pipeline technikai értelemben lefut, de
+	•	filológiai / kutatási értelemben az eredmény nem tekinthető véglegesnek.
+
+Ez nem hiba az agent működésében, hanem a jelenlegi normalizálási stratégia következménye.
+
+Mikor tekinthető elfogadhatónak ez az állapot?
+
+Ez az állapot elfogadható, ha:
+	•	technikai dry run-t végzünk,
+	•	az agent logikáját, állapotkezelését, fájlstruktúráját teszteljük,
+	•	a v1 (diplomatic) szöveg a kutatás tényleges inputja,
+	•	vagy a normalizálás csak demonstrációs / ideiglenes célú.
+
+Mikor NEM elfogadható?
+
+Nem elfogadható végleges eredményként, ha:
+	•	bármely oldal status: failed,
+	•	a corrected_v2.txt lényegesen rövidebb, mint a diplomatic_v1.txt,
+	•	a normalizált szöveg nem fedi le az összes oldalt.
+
+Recovery / javítási stratégia
+
+Ha a normalizált v2 részleges:
+	1.	Ellenőrizd az agent állapotot:
+
+python3 -c "import json; d=json.load(open('agent_state/<source>.state.json')); print([ (p['page'], p['status']) for p in d['pages'] ])"
+
+
+	2.	Javítsd újra a hibás oldalakat (status: failed vagy pending).
+	3.	Csak akkor futtasd újra a normalizálást, ha:
+	•	nincs failed oldal,
+	•	a diplomatic v1 teljes.
+
+ Tervezett fejlesztés
+
+Egy következő iterációban a normalizálás:
+	•	oldalanként (v2 per page),
+	•	vagy chunk-alapúan
+fog történni, külön editloggal, majd összefűzéssel.
+
+Ez jobban illeszkedik filológiai és akadémiai munkafolyamatokhoz, és robusztusabb hibakezelést tesz lehetővé.
+
