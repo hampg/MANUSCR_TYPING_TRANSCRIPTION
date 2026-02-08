@@ -27,6 +27,8 @@ import shutil
 import subprocess
 import time
 import base64
+import signal
+import multiprocessing as mp
 from dataclasses import dataclass, asdict
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -108,6 +110,12 @@ def save_state(state: AgentState, state_path: Path) -> None:
 # Helpers
 # ----------------------------
 
+def _process_timeout_worker(q, fn, args, kwargs):
+    try:
+        q.put(("ok", fn(*args, **kwargs)))
+    except Exception as e:
+        q.put(("err", (type(e).__name__, str(e))))
+        
 def run(cmd: List[str]) -> None:
     p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     if p.returncode != 0:
@@ -150,7 +158,50 @@ def load_prompt_file(path: Path) -> str:
         raise FileNotFoundError(f"Missing prompt file: {path}")
     return path.read_text(encoding="utf-8")
 
+class HardTimeout(Exception):
+    pass
 
+def _alarm_handler(signum, frame):
+    raise HardTimeout("Hard timeout reached")
+
+def call_with_hard_timeout(seconds: int, fn, *args, **kwargs):
+    """
+    macOS/Linux: SIGALRM működik (main thread).
+    Biztosíték arra, hogy egy oldal ne tudjon végtelenül lógni.
+    """
+    old = signal.signal(signal.SIGALRM, _alarm_handler)
+    signal.alarm(seconds)
+    try:
+        return fn(*args, **kwargs)
+    finally:
+        signal.alarm(0)
+        signal.signal(signal.SIGALRM, old)
+        
+def call_with_process_timeout(seconds: int, fn, *args, **kwargs):
+    """
+    Biztos timeout: külön processben futtatja az fn-t.
+    Ha seconds lejár, terminate.
+    Visszaadja az fn eredményét vagy TimeoutError-t dob.
+    """
+    q: mp.Queue = mp.Queue()
+    p = mp.Process(target=_process_timeout_worker, args=(q, fn, args, kwargs))
+    p.start()
+    p.join(seconds)
+
+    if p.is_alive():
+        p.terminate()
+        p.join(5)
+        raise TimeoutError(f"Process timeout after {seconds}s")
+
+    if q.empty():
+        raise RuntimeError("Worker exited without returning result")
+
+    status, payload = q.get()
+    if status == "ok":
+        return payload
+    name, msg = payload
+    raise RuntimeError(f"Worker error {name}: {msg}")
+        
 # ----------------------------
 # PDF -> PNG
 # ----------------------------
@@ -259,13 +310,20 @@ def parse_three_block_output(raw: str) -> Tuple[str, List[Dict[str, Any]], Dict[
     return corrected, editlog, meta
 
 
-def transcribe_page_openai(prompt_rules: str, image_path: Path, source_id: str, lang: str, page_num: int, page_id: str) -> Tuple[str, Dict[str, Any]]:
+def transcribe_page_openai(
+    prompt_rules: str,
+    image_path: Path,
+    source_id: str,
+    lang: str,
+    page_num: int,
+    page_id: str,
+) -> Tuple[str, Dict[str, Any]]:
     try:
-        from openai import OpenAI
+        from openai import OpenAI, APITimeoutError, APIConnectionError, RateLimitError, APIError
     except Exception as e:
         raise RuntimeError("OpenAI SDK not installed. Run: pip install openai") from e
 
-    client = OpenAI()
+    client = OpenAI(timeout=600, max_retries=0)
     model_id = os.environ.get("TRANSCRIBE_MODEL", "gpt-4.1")
 
     user_prompt = f"""Language: {lang}
@@ -279,23 +337,34 @@ Do not translate. Use the required output block headers and JSON schema.
 
     img_b64 = base64.b64encode(image_path.read_bytes()).decode("utf-8")
     data_url = f"data:image/png;base64,{img_b64}"
-    resp = client.responses.create(
-        model=model_id,
-        temperature=0.0,
-        input=[
-            {"role": "system", "content": prompt_rules},
-            {
-                "role": "user",
-                "content": [
-                    {"type": "input_text", "text": user_prompt},
-                    {"type": "input_image", "image_url": data_url},
-                ],
-            },
-        ],
-    )
 
-    transcription, meta = parse_dual_block_output(resp.output_text)
-    return transcription, meta
+    last_err = None
+    for attempt in range(1, 5):
+        try:
+            resp = client.responses.create(
+                model=model_id,
+                temperature=0.0,
+                input=[
+                    {"role": "system", "content": prompt_rules},
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "input_text", "text": user_prompt},
+                            {"type": "input_image", "image_url": data_url},
+                        ],
+                    },
+                ],
+            )
+            transcription, meta = parse_dual_block_output(resp.output_text)
+            return transcription, meta
+
+        except (APITimeoutError, APIConnectionError, RateLimitError, APIError) as e:
+            last_err = e
+            if attempt == 4:
+                raise
+            time.sleep(5 * (2 ** (attempt - 1)))
+
+    raise last_err
 
 
 def normalize_v2_openai(prompt_rules: str, v1_text: str, source_id: str, lang: str) -> Tuple[str, List[Dict[str, Any]], Dict[str, Any]]:
@@ -488,6 +557,7 @@ def run_agent_for_pdf(pdf_path: Path, project_root: Path, lang: str, use_api: bo
                     transcription, meta = make_generated_stub(source_id, ps.page, page_id)
                     save_stub_diplomatic(stubs_root, page_id, transcription, meta)
                     log(f"Stub generated+saved: {page_id}")
+            
             else:
                 # API mode -> real call
                 if stub_mode == "replay":
@@ -497,12 +567,23 @@ def run_agent_for_pdf(pdf_path: Path, project_root: Path, lang: str, use_api: bo
                     transcription, meta = loaded
                     log(f"Stub replay (API suppressed): {page_id}")
                 else:
-                    transcription, meta = transcribe_page_openai(diplomatic_prompt, image_path, source_id, lang, ps.page, page_id)
-                    log(f"Transcribed: page {ps.page} (model call)")
-                    if stub_mode == "record":
-                        save_stub_diplomatic(stubs_root, page_id, transcription, meta)
-                        log(f"Stub recorded: {page_id}")
-
+                    log(f"Calling model for page {ps.page} (page_id={page_id})...")
+                    try:
+                        transcription, meta = call_with_process_timeout(
+                            180,
+                            transcribe_page_openai,
+                            diplomatic_prompt, image_path, source_id, lang, ps.page, page_id
+                        )
+                        log(f"Transcribed: page {ps.page} (model call)")
+                        if stub_mode == "record":
+                            save_stub_diplomatic(stubs_root, page_id, transcription, meta)
+                            log(f"Stub recorded: {page_id}")
+                    except Exception as e:
+                        ps.status = "failed"
+                        ps.notes = f"Model call failed: {type(e).__name__}: {e}"
+                        save_state(state, state_path)
+                        log(f"FAILED page {ps.page}: {type(e).__name__}: {e}")
+                        continue
             # Persist page artifacts
             uncertain, illegible = count_markers(transcription)
             ps.uncertain_count = uncertain
